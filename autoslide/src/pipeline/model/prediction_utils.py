@@ -114,12 +114,18 @@ def predict_single_image(model, image, device, transform, return_time=False):
     # Transform image
     img_tensor = transform(image).to(device)
 
-    # Measure prediction time if requested
+    # Measure prediction time if requested. CUDA kernel launches are async,
+    # so an explicit sync is needed on both ends of the timed region for an
+    # accurate wall-clock measurement.
+    if return_time and device.type == "cuda":
+        torch.cuda.synchronize()
     start_time = time.time() if return_time else None
 
     with torch.no_grad():
         predictions = model([img_tensor])
 
+    if return_time and device.type == "cuda":
+        torch.cuda.synchronize()
     end_time = time.time() if return_time else None
     prediction_time = (end_time - start_time) if return_time else None
 
@@ -159,12 +165,50 @@ def predict_single_image(model, image, device, transform, return_time=False):
         return combined_mask
 
 
-def setup_device():
+def predict_batch(model, images, device, transform, synchronize_cuda=True):
+    """
+    Time a single batched forward pass. Timing-only -- does not decode masks.
+
+    Args:
+        model (torch.nn.Module): Trained Mask R-CNN model
+        images (list[PIL.Image]): Batch of input images
+        device (torch.device): Device to run inference on
+        transform (callable): Image transformation function
+        synchronize_cuda (bool): Call torch.cuda.synchronize() around the
+            timed region on CUDA devices, so async kernel launches don't
+            leak outside the measured window.
+
+    Returns:
+        float: wall-clock seconds for the batched forward pass
+    """
+    img_tensors = [transform(image).to(device) for image in images]
+
+    if device.type == "cuda" and synchronize_cuda:
+        torch.cuda.synchronize()
+    start_time = time.time()
+
+    with torch.no_grad():
+        _ = model(img_tensors)
+
+    if device.type == "cuda" and synchronize_cuda:
+        torch.cuda.synchronize()
+    end_time = time.time()
+
+    return end_time - start_time
+
+
+def setup_device(force_cpu=False):
     """
     Setup and return the appropriate device for inference.
+
+    Args:
+        force_cpu (bool): If True, always return the CPU device regardless
+            of CUDA availability.
 
     Returns:
         torch.device: Device to use for inference
     """
+    if force_cpu:
+        return torch.device("cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return device
