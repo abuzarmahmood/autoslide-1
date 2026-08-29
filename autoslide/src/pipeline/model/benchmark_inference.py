@@ -69,12 +69,17 @@ def sample_batches(image_names, batch_size, num_batches, rng):
     return [selected[i * batch_size:(i + 1) * batch_size] for i in range(num_batches)]
 
 
-def run_batch_sweep(model, device, transform, image_dir, image_names,
-                    batch_sizes, num_warmup_batches, num_timed_batches, seed):
+def run_one_batch_size(model, device, transform, image_dir, image_names,
+                       batch_size, num_warmup_batches, num_timed_batches, seed):
+    """
+    Run warmup + timed batches for a single batch size. Returns whatever
+    timed rows were collected -- an OOM anywhere in this batch size's
+    warmup or timed batches is caught here and does not propagate, so the
+    caller can keep going with the next batch size.
+    """
+    rng = random.Random(seed * 10_000 + batch_size)
     rows = []
-    for batch_size in batch_sizes:
-        rng = random.Random(seed * 10_000 + batch_size)
-
+    try:
         warmup_batches = sample_batches(
             image_names, batch_size, num_warmup_batches, rng)
         for names in tqdm(warmup_batches, desc=f"Warmup bs={batch_size}"):
@@ -85,13 +90,7 @@ def run_batch_sweep(model, device, transform, image_dir, image_names,
             image_names, batch_size, num_timed_batches, rng)
         for names in tqdm(timed_batches, desc=f"Timed bs={batch_size}"):
             images = load_images(image_dir, names)
-            try:
-                batch_time = predict_batch(model, images, device, transform)
-            except torch.cuda.OutOfMemoryError:
-                print(
-                    f"OOM at batch_size={batch_size}; skipping remaining batches for this size")
-                torch.cuda.empty_cache()
-                break
+            batch_time = predict_batch(model, images, device, transform)
             rows.append({
                 "batch_size": batch_size,
                 "batch_time_s": batch_time,
@@ -99,6 +98,10 @@ def run_batch_sweep(model, device, transform, image_dir, image_names,
                 "num_threads": torch.get_num_threads(),
                 "image_names": ";".join(names),
             })
+    except torch.cuda.OutOfMemoryError:
+        print(
+            f"OOM at batch_size={batch_size}; skipping remaining batches for this size")
+        torch.cuda.empty_cache()
     return rows
 
 
@@ -147,10 +150,6 @@ def main():
     print(
         f"Running batch sweep {batch_sizes} on {len(image_names)} images using device: {device}")
 
-    rows = run_batch_sweep(
-        model, device, transform, args.image_dir, image_names,
-        batch_sizes, args.num_warmup_batches, args.num_timed_batches, args.seed)
-
     gpu_name = get_gpu_name(device)
     hostname = socket.gethostname()
 
@@ -158,25 +157,32 @@ def main():
         os.path.abspath(args.output_csv)), exist_ok=True)
     fieldnames = ["batch_size", "batch_time_s", "per_image_time_s",
                   "device_type", "gpu_name", "hostname", "num_threads", "image_names"]
+
+    # Write incrementally (flush per batch size) so a crash partway through
+    # the sweep doesn't discard already-collected batch sizes.
     with open(args.output_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in rows:
-            row["device_type"] = device.type
-            row["gpu_name"] = gpu_name
-            row["hostname"] = hostname
-            writer.writerow(row)
+        for batch_size in batch_sizes:
+            bs_rows = run_one_batch_size(
+                model, device, transform, args.image_dir, image_names,
+                batch_size, args.num_warmup_batches, args.num_timed_batches, args.seed)
+            for row in bs_rows:
+                row["device_type"] = device.type
+                row["gpu_name"] = gpu_name
+                row["hostname"] = hostname
+                writer.writerow(row)
+            f.flush()
+
+            if not bs_rows:
+                print(f"  batch_size={batch_size}: no timed batches (OOM?)")
+                continue
+            mean_per_image = sum(r["per_image_time_s"]
+                                 for r in bs_rows) / len(bs_rows)
+            print(f"  batch_size={batch_size}: mean {mean_per_image:.4f}s/image "
+                  f"({1.0 / mean_per_image:.2f} img/s) over {len(bs_rows)} batches")
 
     print(f"Device: {device} ({gpu_name}) on host {hostname}")
-    for batch_size in batch_sizes:
-        bs_rows = [r for r in rows if r["batch_size"] == batch_size]
-        if not bs_rows:
-            print(f"  batch_size={batch_size}: no timed batches (OOM?)")
-            continue
-        mean_per_image = sum(r["per_image_time_s"]
-                             for r in bs_rows) / len(bs_rows)
-        print(f"  batch_size={batch_size}: mean {mean_per_image:.4f}s/image "
-              f"({1.0 / mean_per_image:.2f} img/s) over {len(bs_rows)} batches")
     print(f"Results written to: {args.output_csv}")
 
 
